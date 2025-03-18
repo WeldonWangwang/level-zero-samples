@@ -141,7 +141,7 @@ sycl::event launchSPVKernelFromOpenCLOffline(sycl::queue &queue, size_t length, 
 ze_event_handle_t launchSPVKernelFromOpenCLOfflineLZ(ze_command_queue_handle_t queue, ze_context_handle_t context, ze_device_handle_t device, uint32_t length, float *X, float *Y, float *Z)
 {
     // Load SPIR-V binary
-    std::string spirv_fn = "../matmul.spv";
+    std::string spirv_fn = "../../00_onednn_with_l0/matmul.spv";
     std::ifstream spirv_file(spirv_fn, std::ios::binary);
     if (!spirv_file.is_open())
     {
@@ -341,7 +341,7 @@ dnnl::matmul create_onednn_kernel(dnnl::engine engine, int size) {
 int main(int argc, char* argv[]) {
     bool enable_lz_event;
     if (argc < 2) {
-        cout << "Please set if enable Level Zero event control" << endl;
+        std::cout << "Please set if enable Level Zero event control" << std::endl;
         return 1;
     }
     std::string arg = argv[1];
