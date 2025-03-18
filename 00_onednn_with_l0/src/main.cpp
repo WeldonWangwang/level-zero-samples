@@ -199,7 +199,6 @@ ze_event_handle_t launchSPVKernelFromOpenCLOfflineLZ(ze_command_queue_handle_t q
 
 sycl::event launchOpenCLKernelOnline(sycl::queue &q, size_t length, float *X, float *Z, int32_t offset)
 {
-    std::cout << "== Start to test launch OpenCL kernel and compile online." << std::endl;
     // Kernel defined as an OpenCL C string.  This could be dynamically
     // generated instead of a literal.
     std::string source = R"""(
