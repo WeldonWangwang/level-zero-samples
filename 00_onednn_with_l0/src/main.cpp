@@ -138,10 +138,10 @@ sycl::event launchSPVKernelFromOpenCLOffline(sycl::queue &queue, size_t length, 
     return myLaunchKernel(&queue, kernel, length, reinterpret_cast<void **>(params), 3u);
 }
 
-ze_event_handle_t launchSPVKernelFromOpenCLOfflineLZ(ze_command_queue_handle_t queue, ze_context_handle_t context, ze_device_handle_t device, uint32_t length, float *X, float *Y, float *Z)
+ze_event_handle_t launchSPVKernelFromOpenCLOfflineLZ(ze_command_queue_handle_t queue, ze_context_handle_t context, ze_device_handle_t device, uint32_t length, float *X, float *Y, float *Z, ze_event_handle_t event)
 {
     // Load SPIR-V binary
-    std::string spirv_fn = "../../00_onednn_with_l0/matmul.spv";
+    std::string spirv_fn = "/mnt/users/odt/www/level-zero-samples/00_onednn_with_l0/matmul.spv";
     std::ifstream spirv_file(spirv_fn, std::ios::binary);
     if (!spirv_file.is_open())
     {
@@ -190,22 +190,68 @@ ze_event_handle_t launchSPVKernelFromOpenCLOfflineLZ(ze_command_queue_handle_t q
     eventDesc.signal = ZE_EVENT_SCOPE_FLAG_HOST;
     eventDesc.wait = ZE_EVENT_SCOPE_FLAG_HOST;
     zeEventCreate(eventPool, &eventDesc, &kernelEvent);
-
-    zeCommandListAppendLaunchKernel(cmdList, zeKernel, &launchArgs, kernelEvent, 0, nullptr);
+    zeCommandListAppendLaunchKernel(cmdList, zeKernel, &launchArgs, kernelEvent, 1, &event);
     zeCommandListClose(cmdList);
     zeCommandQueueExecuteCommandLists(queue, 1, &cmdList, nullptr);
     return kernelEvent;
 }
 
-sycl::event launchOpenCLKernelOnline(sycl::queue &q, size_t length, float *X, float *Z, int32_t offset)
+sycl::event launchOpenCLKernelOnline(sycl::queue &q, sycl::kernel k, size_t length, float *X, float *Y, float *Z)
 {
-    // Kernel defined as an OpenCL C string.  This could be dynamically
-    // generated instead of a literal.
+    sycl::buffer inputbuf((uint8_t*)X, sycl::range{length*length*sizeof(float)});
+    sycl::buffer weightbuf((uint8_t*)Y, sycl::range{length*length*sizeof(float)});
+    sycl::buffer outputbuf((uint8_t*)Z, sycl::range{length*length*sizeof(float)});
+
+    std::vector<sycl_args> inputs_buf;
+    inputs_buf.push_back(sycl_args(inputbuf, false));
+    inputs_buf.push_back(sycl_args(weightbuf, false));
+    inputs_buf.push_back(sycl_args(outputbuf, true));
+    inputs_buf.push_back(sycl_args(length));
+    inputs_buf.push_back(sycl_args(length));
+    inputs_buf.push_back(sycl_args(length));
+
+    // sycl::event sycl_event = sycl::make_event<sycl::backend::ext_oneapi_level_zero>(
+    //     { ze_event, sycl::ext::oneapi::level_zero::ownership::keep }, q.get_context());
+    return q.submit([&](sycl::handler &cgh)
+                    {
+                        // cgh.depends_on(sycl_event);
+                        for (int i = 0; i < inputs_buf.size(); i++)
+                        {
+                            my_set_args(cgh, i, inputs_buf[i]);
+                        }
+                        // Invoke the kernel over an nd-range.
+                        // sycl::nd_range ndr{{length*length}, {WGSIZE}};
+                        // cgh.parallel_for(ndr, k);
+                        cgh.parallel_for(sycl::range<2>(length, length), k);
+                    });
+}
+
+sycl::kernel create_opencl_kernel_online(sycl::queue &q) {
     std::string source = R"""(
-        __kernel void my_kernel(__global float *in, __global float *out, int offset_val) {
-            size_t i = get_global_id(0);
-            out[i] = out[i] / 1e+27 + in[i] / 1e+27 + offset_val;
-            // printf("  == offset_val = %d, i = %d\n", offset_val, i);
+        __kernel void my_kernel(
+            __global float* A,  // 输入矩阵 A
+            __global float* B,  // 输入矩阵 B
+            __global float* C,  // 输出矩阵 C
+            const int M,        // A 的行数
+            const int N,        // A 的列数 / B 的行数
+            const int K         // B 的列数
+        ) {
+            // 获取当前 work-item 的全局 ID
+            int row = get_global_id(0);  // 行索引
+            int col = get_global_id(1);  // 列索引
+
+            // 仅计算有效的 C[row, col]
+            if (row < M && col < K) {
+                float sum = 0.0f;
+
+                // 计算点积 A[row, :] * B[:, col]
+                for (int i = 0; i < N; i++) {
+                    sum += A[row * N + i] * B[i * K + col];
+                }
+
+                // 存储到 C
+                C[row * K + col] = sum;
+            }
         }
     )""";
 
@@ -222,40 +268,24 @@ sycl::event launchOpenCLKernelOnline(sycl::queue &q, size_t length, float *X, fl
     // Get a "kernel" object representing the kernel defined in the
     // source string.
     sycl::kernel k = kb_exe.ext_oneapi_get_kernel("my_kernel");
+    return k;
+}
 
-    constexpr int WGSIZE = 1;
+sycl::event launch_sycl_kernel(sycl::queue sycl_queue, int M, int K, int N, float* src, float* weights, float* out, sycl::event dep){
+    auto event5 = sycl_queue.submit([&](sycl::handler& h) {
+            h.depends_on(dep);
+            h.parallel_for(sycl::range<2>(M, N), [=](sycl::id<2> idx) {
+                int row = idx[0];
+                int col = idx[1];
 
-#define UNIFY_DATA_TYPE 1
-#if UNIFY_DATA_TYPE
-    sycl::buffer inputbuf((uint8_t*)X, sycl::range{length*sizeof(float)});
-    sycl::buffer outputbuf((uint8_t*)Z, sycl::range{length*sizeof(float)});
-
-    std::vector<sycl_args> inputs_buf;
-    inputs_buf.push_back(sycl_args(inputbuf, false));
-    inputs_buf.push_back(sycl_args(outputbuf, true));
-    inputs_buf.push_back(sycl_args(offset));
-#else
-    sycl::buffer inputbuf(X, sycl::range{length});
-    sycl::buffer outputbuf(Z, sycl::range{length});
-#endif
-
-    return q.submit([&](sycl::handler &cgh)
-                    {
-#if UNIFY_DATA_TYPE
-                        for (int i = 0; i < inputs_buf.size(); i++)
-                        {
-                            my_set_args(cgh, i, inputs_buf[i]);
-                        }
-#else
-                        sycl::accessor in{inputbuf, cgh, sycl::read_only};
-                        sycl::accessor out{outputbuf, cgh, sycl::read_write};
-                        cgh.set_args(in, out); // All arguments
-                        cgh.set_arg(2, offset); // scalar param
-#endif
-                        // Invoke the kernel over an nd-range.
-                        sycl::nd_range ndr{{length}, {WGSIZE}};
-                        cgh.parallel_for(ndr, k);
-                    });
+                float sum = 0.0f;
+                for (int i = 0; i < K; i++) {
+                    sum += src[row * K + i] * weights[i * N + col];
+                }
+                out[row * N + col] = sum / 1.0e+27f;
+            });
+        });
+    return event5;
 }
 
 auto init_level_zero()
@@ -312,24 +342,24 @@ auto init_oneDNN(sycl::device sycl_device, sycl::context sycl_context, sycl::que
 	return std::make_tuple(eng, strm);
 }
 
-sycl::event onednn_mutamul_execute(dnnl::engine engine, dnnl::stream stream, dnnl::matmul matmul_prim, int size, float *src, float *weights, float *dst) {
-    dnnl::memory src_mem({{{size, size}}, dnnl::memory::data_type::f32, dnnl::memory::format_tag::ab}, engine, src);
-    dnnl::memory weights_mem({{{size, size}}, dnnl::memory::data_type::f32, dnnl::memory::format_tag::ab}, engine, weights);
-    dnnl::memory dst_mem({{{size, size}}, dnnl::memory::data_type::f32, dnnl::memory::format_tag::ab}, engine, dst);
+sycl::event onednn_mutamul_execute(dnnl::engine engine, dnnl::stream stream, dnnl::matmul matmul_prim, int M, int K, int N, float *src, float *weights, float *dst, const std::vector<sycl::event> &deps = {}) {
+    dnnl::memory src_mem({{{M, K}}, dnnl::memory::data_type::f32, dnnl::memory::format_tag::ab}, engine, src);
+    dnnl::memory weights_mem({{{K, N}}, dnnl::memory::data_type::f32, dnnl::memory::format_tag::ab}, engine, weights);
+    dnnl::memory dst_mem({{{M, N}}, dnnl::memory::data_type::f32, dnnl::memory::format_tag::ab}, engine, dst);
 
 	sycl::event event = dnnl::sycl_interop::execute(
 		matmul_prim, stream,
 		{{DNNL_ARG_SRC, src_mem},
 		 {DNNL_ARG_WEIGHTS, weights_mem},
-		 {DNNL_ARG_DST, dst_mem}});
+		 {DNNL_ARG_DST, dst_mem}}, deps);
     return event;
 }
 
-dnnl::matmul create_onednn_kernel(dnnl::engine engine, int size) {
+dnnl::matmul create_onednn_kernel(dnnl::engine engine, int M, int K, int N) {
     auto matmul_pd = dnnl::matmul::primitive_desc(engine, 
-        dnnl::memory::desc({size, size}, dnnl::memory::data_type::f32, dnnl::memory::format_tag::ab),
-        dnnl::memory::desc({size, size}, dnnl::memory::data_type::f32, dnnl::memory::format_tag::ab),
-        dnnl::memory::desc({size, size}, dnnl::memory::data_type::f32, dnnl::memory::format_tag::ab)
+        dnnl::memory::desc({M, K}, dnnl::memory::data_type::f32, dnnl::memory::format_tag::ab),
+        dnnl::memory::desc({K, N}, dnnl::memory::data_type::f32, dnnl::memory::format_tag::ab),
+        dnnl::memory::desc({M, N}, dnnl::memory::data_type::f32, dnnl::memory::format_tag::ab)
     );
 
     auto matmul_prim = dnnl::matmul(matmul_pd);
@@ -374,46 +404,47 @@ int main(int argc, char* argv[]) {
 	float *B;
 	float *C;
 	float *D;
+	float *E;
 	CHECK_ZE_RESULT(zeMemAllocShared(context, &device_mem_desc, &host_mem_desc, m * m * sizeof(float), 64, device, (void **)&A), "zeMemAllocShared failed for A");
 	CHECK_ZE_RESULT(zeMemAllocShared(context, &device_mem_desc, &host_mem_desc, m * m * sizeof(float), 64, device, (void **)&B), "zeMemAllocShared failed for B");
 	CHECK_ZE_RESULT(zeMemAllocShared(context, &device_mem_desc, &host_mem_desc, m * m * sizeof(float), 64, device, (void **)&C), "zeMemAllocShared failed for C");
 	CHECK_ZE_RESULT(zeMemAllocShared(context, &device_mem_desc, &host_mem_desc, m * m * sizeof(float), 64, device, (void **)&D), "zeMemAllocShared failed for C");
+	CHECK_ZE_RESULT(zeMemAllocShared(context, &device_mem_desc, &host_mem_desc, m * m * sizeof(float), 64, device, (void **)&E), "zeMemAllocShared failed for C");
 
 
-    for (int i = 0; i < m * m; i++) A[i] = i + 1;   // A: 1,2,3,...
-    for (int i = 0; i < m * m; i++) B[i] = (i % 2 + 1) / 2; // B: 0.5,1,0.5,1,0.5,1,...
+    for (int i = 0; i < m * m; i++) A[i] = i % 2 + 1;   // A: 1,2,1,...
+    for (int i = 0; i < m * m; i++) B[i] = i % 2 + 1; // B: 1,2,1,...
     for (int i = 0; i < m * m; i++) C[i] = 0; // C = 0
     for (int i = 0; i < m * m; i++) D[i] = 0; // D = 0
+    for (int i = 0; i < m * m; i++) E[i] = 0; // D = 0
 
-    auto matmul_prim = create_onednn_kernel(oneDNN_eng, m);
-    auto event1 = onednn_mutamul_execute(oneDNN_eng, oneDNN_strm, matmul_prim, m, A, B, C);
-    if (enable_lz_event) {
-        ze_event_handle_t level0_event1 = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(event1);
-        zeEventHostSynchronize(level0_event1, UINT64_MAX); // Wait for completion
-    }
+    auto matmul_prim = create_onednn_kernel(oneDNN_eng, m, m, m);
+    auto matmul_opencl = create_opencl_kernel_online(sycl_queue);
 
-    auto event2 = onednn_mutamul_execute(oneDNN_eng, oneDNN_strm, matmul_prim, m, C, A, D);
-    if (enable_lz_event) {
-        ze_event_handle_t level0_event2 = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(event2);
-        zeEventHostSynchronize(level0_event2, UINT64_MAX); // Wait for completion
-    }
+    sycl::event event = launchOpenCLKernelOnline(sycl_queue, matmul_opencl, m, A, B, C);
+    // sycl event -> sycl
+    sycl::event event1 = onednn_mutamul_execute(oneDNN_eng, oneDNN_strm, matmul_prim, m, m, m, C, B, D, {event});
+    // sycl event -> sycl
+    sycl::event event2 = onednn_mutamul_execute(oneDNN_eng, oneDNN_strm, matmul_prim, m, m, m, D, A, C, {event1});
+    // sycl event -> L0
+    ze_event_handle_t level0_event2 = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(event2);
+    ze_event_handle_t level0_event3 = launchSPVKernelFromOpenCLOfflineLZ(command_queue, context, device, 512, C, D, E, level0_event2);
+    // L0 event -> L0
+    ze_event_handle_t level0_event4 = launchSPVKernelFromOpenCLOfflineLZ(command_queue, context, device, 512, A, E, C, level0_event3);
+    // L0 event -> sycl
+    sycl::event sycl_event4 = sycl::make_event<sycl::backend::ext_oneapi_level_zero>(
+        { level0_event4, sycl::ext::oneapi::level_zero::ownership::keep }, sycl_queue.get_context());
+    sycl::event event5 = launch_sycl_kernel(sycl_queue, m, m, m, B, C, D, sycl_event4);
 
-    ze_event_handle_t level0_event3 = launchSPVKernelFromOpenCLOfflineLZ(command_queue, context, device, 512, C, D, A);
     if (enable_lz_event) {
-        zeCommandQueueSynchronize(command_queue, UINT64_MAX);
-        zeEventHostSynchronize(level0_event3, UINT64_MAX); // Wait for completion
+        ze_event_handle_t level0_event5 = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(event5);
+        zeEventHostSynchronize(level0_event5, UINT64_MAX); // Wait for completion
     }
-
-    auto event4 = launchOpenCLKernelOnline(sycl_queue, m * m, A, B, 0);
-    if (enable_lz_event) {
-        ze_event_handle_t level0_event4 = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(event4);
-        zeEventHostSynchronize(level0_event4, UINT64_MAX); // Wait for completion
-    }
-    const float expected[] = {75.592};
+    const float expected[] = {1.2292};
     bool success = true;
-    if (std::abs(B[0] - expected[0]) > 1e-4) {
-        std::cout << B[0] << " " << expected[0] << std::endl;
-        std::cout << std::abs(B[0] - expected[0]) << std::endl;
+    if (std::abs(D[0] - expected[0]) > 1e-4) {
+        std::cout << D[0] << " " << expected[0] << std::endl;
+        std::cout << std::abs(D[0] - expected[0]) << std::endl;
         success = false;
     }
     if (B[0] == expected[0]) {
@@ -426,7 +457,7 @@ int main(int argc, char* argv[]) {
     zeMemFree(context, B);
     zeMemFree(context, C);
     zeMemFree(context, D);
-
+    zeMemFree(context, E);
     zeContextDestroy(context);
 
     return 0;
